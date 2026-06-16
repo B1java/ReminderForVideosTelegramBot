@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -553,11 +554,19 @@ async def delete_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
-async def send_reminder(application: Application, chat_id: int | str, text: str) -> None:
+async def send_reminder(application: Application, chat_id: int | str, text: str) -> str | None:
     try:
         await application.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
-    except Exception:
-        logger.exception("Failed to send reminder to chat_id=%s", chat_id)
+    except (BadRequest, Forbidden) as exc:
+        logger.warning("Cannot send reminder to chat_id=%s: %s", chat_id, exc)
+        return str(exc)
+    except TelegramError as exc:
+        logger.warning("Telegram error while sending reminder to chat_id=%s: %s", chat_id, exc)
+        return str(exc)
+    except Exception as exc:
+        logger.exception("Unexpected error while sending reminder to chat_id=%s", chat_id)
+        return str(exc)
+    return None
 
 
 async def run_daily_check(application: Application, *, reply_to_admin: bool = False) -> None:
@@ -581,7 +590,17 @@ async def run_daily_check(application: Application, *, reply_to_admin: bool = Fa
 
         await send_reminder(application, ADMIN_USER_ID, text)
         for chat_id in profile.chat_ids:
-            await send_reminder(application, chat_id, text)
+            error = await send_reminder(application, chat_id, text)
+            if error:
+                await send_reminder(
+                    application,
+                    ADMIN_USER_ID,
+                    (
+                        f"Не удалось отправить напоминание в чат <code>{html.escape(str(chat_id))}</code> "
+                        f"для профиля <b>{html.escape(profile.name)}</b>.\n"
+                        f"Telegram ответил: <code>{html.escape(error)}</code>"
+                    ),
+                )
 
     if reply_to_admin:
         await send_reminder(application, ADMIN_USER_ID, "Проверка выполнена.")
