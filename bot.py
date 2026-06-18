@@ -7,7 +7,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass
-from datetime import time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Iterable
 from zoneinfo import ZoneInfo
@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -35,6 +35,7 @@ REMINDER_HOUR = int(os.getenv("REMINDER_HOUR", "10"))
 REMINDER_MINUTE = int(os.getenv("REMINDER_MINUTE", "0"))
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
 PROFILES_FILE = Path(os.getenv("PROFILES_FILE", "data/profiles.txt"))
+NETWORK_ERRORS_FILE = Path(os.getenv("NETWORK_ERRORS_FILE", "data/network_errors.txt"))
 
 NAME_MAX_LENGTH = 100
 TOTAL_MIN = 0
@@ -42,6 +43,8 @@ TOTAL_MAX = 100
 PER_DAY_MIN = 0
 PER_DAY_MAX = 15
 CHAT_ID_RE = re.compile(r"^-100\d+$")
+NETWORK_ERROR_WINDOW = timedelta(hours=12)
+NETWORK_ERROR_THRESHOLD = 3
 
 (
     CREATE_NAME,
@@ -202,6 +205,71 @@ class ProfileStore:
 
 
 store = ProfileStore(PROFILES_FILE)
+
+
+class NetworkErrorStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = asyncio.Lock()
+
+    async def add(self, occurred_at: datetime) -> None:
+        async with self._lock:
+            timestamps = self._read_unlocked()
+            timestamps.append(occurred_at)
+            self._write_unlocked(self._recent(timestamps, occurred_at))
+
+    async def count_recent(self, now: datetime) -> int:
+        async with self._lock:
+            recent = self._recent(self._read_unlocked(), now)
+            self._write_unlocked(recent)
+            return len(recent)
+
+    async def clear_recent(self, now: datetime) -> None:
+        async with self._lock:
+            cutoff = now - NETWORK_ERROR_WINDOW
+            remaining = [timestamp for timestamp in self._read_unlocked() if timestamp < cutoff]
+            self._write_unlocked(remaining)
+
+    def _read_unlocked(self) -> list[datetime]:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            self.path.touch()
+            return []
+
+        timestamps: list[datetime] = []
+        for line_number, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                timestamp = datetime.fromisoformat(line)
+            except ValueError:
+                logger.warning("Skipping malformed network error line %s", line_number)
+                continue
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=TIMEZONE)
+            timestamps.append(timestamp)
+        return timestamps
+
+    def _write_unlocked(self, timestamps: list[datetime]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        content = "\n".join(timestamp.isoformat() for timestamp in timestamps)
+        if content:
+            content += "\n"
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.path.parent, delete=False) as temp_file:
+            temp_file.write(content)
+            temp_name = temp_file.name
+
+        Path(temp_name).replace(self.path)
+
+    @staticmethod
+    def _recent(timestamps: list[datetime], now: datetime) -> list[datetime]:
+        cutoff = now - NETWORK_ERROR_WINDOW
+        return [timestamp for timestamp in timestamps if timestamp >= cutoff]
+
+
+network_error_store = NetworkErrorStore(NETWORK_ERRORS_FILE)
 
 
 def validate_profile_name(raw: str) -> str:
@@ -619,7 +687,44 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     await run_daily_check(context.application)
 
 
+def is_polling_read_error(error: object) -> bool:
+    if not isinstance(error, NetworkError):
+        return False
+
+    current: BaseException | None = error
+    while current:
+        error_type = type(current)
+        if error_type.__name__ == "ReadError" and error_type.__module__.split(".", maxsplit=1)[0] in {"httpx", "httpcore"}:
+            return True
+        current = current.__cause__ or current.__context__
+
+    return "ReadError" in str(error)
+
+
+async def network_error_report_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = datetime.now(TIMEZONE)
+    count = await network_error_store.count_recent(now)
+    if count < NETWORK_ERROR_THRESHOLD:
+        return
+
+    error = await send_reminder(
+        context.application,
+        ADMIN_USER_ID,
+        (
+            "За последние 12 часов бот несколько раз терял соединение с Telegram API.\n"
+            f"Количество сетевых ошибок чтения: <b>{count}</b>."
+        ),
+    )
+    if error is None:
+        await network_error_store.clear_recent(now)
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if is_polling_read_error(context.error):
+        await network_error_store.add(datetime.now(TIMEZONE))
+        logger.warning("Telegram polling read error recorded", exc_info=context.error)
+        return
+
     logger.exception("Unhandled bot error", exc_info=context.error)
     try:
         await context.bot.send_message(ADMIN_USER_ID, "В боте произошла ошибка. Детали записаны в лог.")
@@ -672,6 +777,16 @@ def build_application() -> Application:
         scheduled_check,
         time=time(hour=REMINDER_HOUR, minute=REMINDER_MINUTE, tzinfo=TIMEZONE),
         name="daily-video-reminder",
+    )
+    application.job_queue.run_daily(
+        network_error_report_check,
+        time=time(hour=10, minute=0, tzinfo=TIMEZONE),
+        name="morning-network-error-report",
+    )
+    application.job_queue.run_daily(
+        network_error_report_check,
+        time=time(hour=22, minute=0, tzinfo=TIMEZONE),
+        name="evening-network-error-report",
     )
     return application
 
