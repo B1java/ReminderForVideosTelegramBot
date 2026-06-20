@@ -36,6 +36,10 @@ REMINDER_MINUTE = int(os.getenv("REMINDER_MINUTE", "0"))
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
 PROFILES_FILE = Path(os.getenv("PROFILES_FILE", "data/profiles.txt"))
 NETWORK_ERRORS_FILE = Path(os.getenv("NETWORK_ERRORS_FILE", "data/network_errors.txt"))
+POLLING_TIMEOUT = int(os.getenv("POLLING_TIMEOUT", "30"))
+POLLING_READ_TIMEOUT = float(os.getenv("POLLING_READ_TIMEOUT", "45"))
+POLLING_CONNECT_TIMEOUT = float(os.getenv("POLLING_CONNECT_TIMEOUT", "10"))
+POLLING_POOL_TIMEOUT = float(os.getenv("POLLING_POOL_TIMEOUT", "10"))
 
 NAME_MAX_LENGTH = 100
 TOTAL_MIN = 0
@@ -212,11 +216,13 @@ class NetworkErrorStore:
         self.path = path
         self._lock = asyncio.Lock()
 
-    async def add(self, occurred_at: datetime) -> None:
+    async def add(self, occurred_at: datetime) -> int:
         async with self._lock:
             timestamps = self._read_unlocked()
             timestamps.append(occurred_at)
-            self._write_unlocked(self._recent(timestamps, occurred_at))
+            recent = self._recent(timestamps, occurred_at)
+            self._write_unlocked(recent)
+            return len(recent)
 
     async def count_recent(self, now: datetime) -> int:
         async with self._lock:
@@ -726,8 +732,8 @@ async def network_error_report_check(context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_polling_read_error(context.error):
-        await network_error_store.add(datetime.now(TIMEZONE))
-        logger.warning("Telegram polling read error recorded", exc_info=context.error)
+        count = await network_error_store.add(datetime.now(TIMEZONE))
+        logger.warning("Telegram polling read error recorded: %s (recent_count=%s)", context.error, count)
         return
 
     logger.exception("Unhandled bot error", exc_info=context.error)
@@ -741,7 +747,14 @@ def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set. Create .env from .env.example and set BOT_TOKEN.")
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .get_updates_read_timeout(POLLING_READ_TIMEOUT)
+        .get_updates_connect_timeout(POLLING_CONNECT_TIMEOUT)
+        .get_updates_pool_timeout(POLLING_POOL_TIMEOUT)
+        .build()
+    )
 
     conversation = ConversationHandler(
         entry_points=[
@@ -799,7 +812,13 @@ def build_application() -> Application:
 def main() -> None:
     application = build_application()
     logger.info("Bot started. Profiles file: %s", PROFILES_FILE)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        timeout=POLLING_TIMEOUT,
+        read_timeout=POLLING_READ_TIMEOUT,
+        connect_timeout=POLLING_CONNECT_TIMEOUT,
+        pool_timeout=POLLING_POOL_TIMEOUT,
+    )
 
 
 if __name__ == "__main__":
