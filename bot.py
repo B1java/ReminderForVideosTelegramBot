@@ -42,7 +42,7 @@ TOTAL_MIN = 0
 TOTAL_MAX = 100
 PER_DAY_MIN = 0
 PER_DAY_MAX = 15
-CHAT_ID_RE = re.compile(r"^-100\d+$")
+CHAT_ID_RE = re.compile(r"^-\d+$")
 NETWORK_ERROR_WINDOW = timedelta(hours=12)
 NETWORK_ERROR_THRESHOLD = 3
 
@@ -288,7 +288,7 @@ def parse_chat_ids(raw: str) -> tuple[str, ...]:
 
     invalid = [chat_id for chat_id in chat_ids if not CHAT_ID_RE.fullmatch(chat_id)]
     if invalid:
-        raise ValueError("chat_id должен быть строкой вида -1005289665576")
+        raise ValueError("chat_id должен быть отрицательным числом, например -5225157392")
 
     return chat_ids
 
@@ -353,7 +353,12 @@ def profile_markup(profile_index: int) -> InlineKeyboardMarkup:
 
 async def reply_or_edit(update: Update, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
     if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        try:
+            await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        except BadRequest as exc:
+            if "Message is not modified" not in str(exc):
+                raise
+            logger.debug("Skipped unchanged callback message edit")
     elif update.effective_message:
         await update.effective_message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
@@ -433,7 +438,7 @@ async def create_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await reply_or_edit(update, f"Ошибка: {exc}\nВведите название еще раз:")
         return CREATE_NAME
 
-    await reply_or_edit(update, "Введите chat_id или несколько chat_id через запятую. Формат: -1005289665576")
+    await reply_or_edit(update, "Введите chat_id или несколько chat_id через запятую. Пример: -5225157392")
     return CREATE_CHATS
 
 
