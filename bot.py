@@ -365,6 +365,15 @@ def cancel_edit_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("Отменить", callback_data="cancel_edit")]])
 
 
+def delete_confirmation_markup(profile_index: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Да, удалить", callback_data=f"confirm_delete:{profile_index}")],
+            [InlineKeyboardButton("Отменить", callback_data=f"cancel_delete:{profile_index}")],
+        ]
+    )
+
+
 async def reply_or_edit(update: Update, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
     if update.callback_query:
         try:
@@ -669,7 +678,57 @@ async def delete_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await reply_or_edit(update, "Профиль не найден.", main_menu_markup())
         return ConversationHandler.END
 
+    index = await store.get_index(profile.name)
+    if index is None:
+        await reply_or_edit(update, "Профиль не найден.", main_menu_markup())
+        return ConversationHandler.END
+
+    await reply_or_edit(
+        update,
+        f"Удалить профиль <b>{html.escape(profile.name)}</b>?",
+        delete_confirmation_markup(index),
+    )
+    context.user_data["pending_delete_profile_name"] = profile.name
+    return ConversationHandler.END
+
+
+@admin_only
+async def cancel_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+
+    profile = await get_selected_profile(update, context)
+    if not profile:
+        await reply_or_edit(update, "Профиль не найден.", main_menu_markup())
+        return ConversationHandler.END
+
+    index = await store.get_index(profile.name)
+    if index is None:
+        await reply_or_edit(update, "Профиль не найден.", main_menu_markup())
+        return ConversationHandler.END
+
+    context.user_data.pop("pending_delete_profile_name", None)
+    await reply_or_edit(update, format_profile(profile), profile_markup(index))
+    return ConversationHandler.END
+
+
+@admin_only
+async def confirm_delete_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+
+    profile = await get_selected_profile(update, context)
+    if not profile:
+        await reply_or_edit(update, "Профиль не найден.", main_menu_markup())
+        return ConversationHandler.END
+
+    if context.user_data.get("pending_delete_profile_name") != profile.name:
+        await reply_or_edit(update, "Подтверждение удаления устарело.", main_menu_markup())
+        return ConversationHandler.END
+
     await store.delete(profile.name)
+    context.user_data.pop("pending_delete_profile_name", None)
+    context.user_data.pop("profile_name", None)
     await reply_or_edit(update, "Профиль удален.", main_menu_markup())
     return ConversationHandler.END
 
@@ -810,6 +869,8 @@ def build_application() -> Application:
             CallbackQueryHandler(edit_total_start, pattern=r"^edit_total:\d+$"),
             CallbackQueryHandler(edit_per_day_start, pattern=r"^edit_per_day:\d+$"),
             CallbackQueryHandler(delete_profile, pattern=r"^delete:\d+$"),
+            CallbackQueryHandler(confirm_delete_profile, pattern=r"^confirm_delete:\d+$"),
+            CallbackQueryHandler(cancel_delete, pattern=r"^cancel_delete:\d+$"),
             CallbackQueryHandler(check_now, pattern="^check_now$"),
         ],
         states={
