@@ -13,7 +13,7 @@ from typing import Iterable
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError
 from telegram.ext import (
@@ -365,6 +365,19 @@ def cancel_edit_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("Отменить", callback_data="cancel_edit")]])
 
 
+def cancel_create_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Отменить", callback_data="cancel_create")]])
+
+
+def cancel_create_confirmation_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Да, отменить", callback_data="confirm_cancel_create")],
+            [InlineKeyboardButton("Нет, продолжить", callback_data="resume_create")],
+        ]
+    )
+
+
 def delete_confirmation_markup(profile_index: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -384,6 +397,35 @@ async def reply_or_edit(update: Update, text: str, markup: InlineKeyboardMarkup 
             logger.debug("Skipped unchanged callback message edit")
     elif update.effective_message:
         await update.effective_message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
+
+def set_create_step(context: ContextTypes.DEFAULT_TYPE, step: int) -> int:
+    context.user_data["create_step"] = step
+    return step
+
+
+async def show_create_step(update: Update, context: ContextTypes.DEFAULT_TYPE, step: int) -> int:
+    set_create_step(context, step)
+    if step == CREATE_NAME:
+        await reply_or_edit(update, "Введите название профиля длиной 1-100 символов:", cancel_create_markup())
+        return CREATE_NAME
+    if step == CREATE_CHATS:
+        await reply_or_edit(
+            update,
+            "Введите chat_id или несколько chat_id через запятую. Пример: -5225157392",
+            cancel_create_markup(),
+        )
+        return CREATE_CHATS
+    if step == CREATE_PER_DAY:
+        await reply_or_edit(
+            update,
+            "Введите сколько видео публикуется в день. Диапазон: 0-15",
+            cancel_create_markup(),
+        )
+        return CREATE_PER_DAY
+
+    await reply_or_edit(update, "Меню управления профилями:", main_menu_markup())
+    return ConversationHandler.END
 
 
 def format_profile(profile: Profile) -> str:
@@ -449,8 +491,7 @@ async def create_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if update.callback_query:
         await update.callback_query.answer()
     context.user_data.clear()
-    await reply_or_edit(update, "Введите название профиля длиной 1-100 символов:")
-    return CREATE_NAME
+    return await show_create_step(update, context, CREATE_NAME)
 
 
 @admin_only
@@ -458,11 +499,11 @@ async def create_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     try:
         context.user_data["new_name"] = validate_profile_name(update.effective_message.text)
     except ValueError as exc:
-        await reply_or_edit(update, f"Ошибка: {exc}\nВведите название еще раз:")
-        return CREATE_NAME
+        set_create_step(context, CREATE_NAME)
+        await reply_or_edit(update, f"Ошибка: {exc}\nВведите название еще раз:", cancel_create_markup())
+        return context.user_data["create_step"]
 
-    await reply_or_edit(update, "Введите chat_id или несколько chat_id через запятую. Пример: -5225157392")
-    return CREATE_CHATS
+    return await show_create_step(update, context, CREATE_CHATS)
 
 
 @admin_only
@@ -470,11 +511,11 @@ async def create_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     try:
         context.user_data["new_chats"] = parse_chat_ids(update.effective_message.text)
     except ValueError as exc:
-        await reply_or_edit(update, f"Ошибка: {exc}\nВведите chat_id еще раз:")
-        return CREATE_CHATS
+        set_create_step(context, CREATE_CHATS)
+        await reply_or_edit(update, f"Ошибка: {exc}\nВведите chat_id еще раз:", cancel_create_markup())
+        return context.user_data["create_step"]
 
-    await reply_or_edit(update, "Введите сколько видео публикуется в день. Диапазон: 0-15")
-    return CREATE_PER_DAY
+    return await show_create_step(update, context, CREATE_PER_DAY)
 
 
 @admin_only
@@ -489,12 +530,47 @@ async def create_per_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         await store.create(profile)
     except ValueError as exc:
-        await reply_or_edit(update, f"Ошибка: {exc}\nВведите значение еще раз:")
-        return CREATE_PER_DAY
+        set_create_step(context, CREATE_PER_DAY)
+        await reply_or_edit(update, f"Ошибка: {exc}\nВведите значение еще раз:", cancel_create_markup())
+        return context.user_data["create_step"]
 
     context.user_data.clear()
     await reply_or_edit(update, "Профиль создан. Количество видео по умолчанию: 0.", main_menu_markup())
     return ConversationHandler.END
+
+
+@admin_only
+async def cancel_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+
+    step = context.user_data.get("create_step", CREATE_NAME)
+    context.user_data["pending_cancel_create_step"] = step
+    await reply_or_edit(
+        update,
+        "Отменить создание профиля? Введенные данные будут потеряны.",
+        cancel_create_confirmation_markup(),
+    )
+    return step
+
+
+@admin_only
+async def confirm_cancel_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+
+    context.user_data.clear()
+    await reply_or_edit(update, "Создание профиля отменено.", main_menu_markup())
+    return ConversationHandler.END
+
+
+@admin_only
+async def resume_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+
+    step = context.user_data.pop("pending_cancel_create_step", context.user_data.get("create_step", CREATE_NAME))
+    return await show_create_step(update, context, step)
 
 
 async def get_selected_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Profile | None:
@@ -750,6 +826,8 @@ async def send_reminder(application: Application, chat_id: int | str, text: str)
 
 async def run_daily_check(application: Application, *, reply_to_admin: bool = False) -> None:
     reminders = await store.spend_day()
+    shortage_date = (datetime.now(TIMEZONE) + timedelta(days=1)).date()
+    shortage_date_text = shortage_date.strftime("%d.%m.%Y")
 
     if not reminders and reply_to_admin:
         await send_reminder(application, ADMIN_USER_ID, "Проверка выполнена. Напоминания не нужны.")
@@ -763,7 +841,7 @@ async def run_daily_check(application: Application, *, reply_to_admin: bool = Fa
         )
         text = (
             f"В профиле <b>{html.escape(profile.name)}</b> заканчиваются видео.\n"
-            f"На следующий день доступно <b>{available_tomorrow}</b> видео, "
+            f"На дату <b>{shortage_date_text}</b> доступно <b>{available_tomorrow}</b> видео, "
             f"а нужно <b>{profile.videos_per_day}</b>."
         )
 
@@ -843,6 +921,17 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Failed to notify admin about bot error")
 
 
+async def set_bot_commands(application: Application) -> None:
+    await application.bot.set_my_commands(
+        [
+            BotCommand("start", "открыть главное меню"),
+            BotCommand("menu", "вернуться в главное меню"),
+            BotCommand("profiles", "показать список профилей"),
+            BotCommand("check_now", "запустить проверку сейчас"),
+        ]
+    )
+
+
 def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set. Create .env from .env.example and set BOT_TOKEN.")
@@ -853,6 +942,7 @@ def build_application() -> Application:
         .get_updates_read_timeout(POLLING_READ_TIMEOUT)
         .get_updates_connect_timeout(POLLING_CONNECT_TIMEOUT)
         .get_updates_pool_timeout(POLLING_POOL_TIMEOUT)
+        .post_init(set_bot_commands)
         .build()
     )
 
@@ -874,9 +964,24 @@ def build_application() -> Application:
             CallbackQueryHandler(check_now, pattern="^check_now$"),
         ],
         states={
-            CREATE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_name)],
-            CREATE_CHATS: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_chats)],
-            CREATE_PER_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_per_day)],
+            CREATE_NAME: [
+                CallbackQueryHandler(cancel_create, pattern="^cancel_create$"),
+                CallbackQueryHandler(confirm_cancel_create, pattern="^confirm_cancel_create$"),
+                CallbackQueryHandler(resume_create, pattern="^resume_create$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, create_name),
+            ],
+            CREATE_CHATS: [
+                CallbackQueryHandler(cancel_create, pattern="^cancel_create$"),
+                CallbackQueryHandler(confirm_cancel_create, pattern="^confirm_cancel_create$"),
+                CallbackQueryHandler(resume_create, pattern="^resume_create$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, create_chats),
+            ],
+            CREATE_PER_DAY: [
+                CallbackQueryHandler(cancel_create, pattern="^cancel_create$"),
+                CallbackQueryHandler(confirm_cancel_create, pattern="^confirm_cancel_create$"),
+                CallbackQueryHandler(resume_create, pattern="^resume_create$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, create_per_day),
+            ],
             EDIT_NAME: [
                 CallbackQueryHandler(cancel_edit, pattern="^cancel_edit$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_name),
