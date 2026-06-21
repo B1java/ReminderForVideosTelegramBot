@@ -125,6 +125,10 @@ class ProfileStore:
             return None
         return profiles[index]
 
+    async def get_index(self, name: str) -> int | None:
+        profiles = await self.list()
+        return self._find_index(profiles, name)
+
     async def create(self, profile: Profile) -> None:
         async with self._lock:
             profiles = self._read_unlocked()
@@ -357,6 +361,10 @@ def profile_markup(profile_index: int) -> InlineKeyboardMarkup:
     )
 
 
+def cancel_edit_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Отменить", callback_data="cancel_edit")]])
+
+
 async def reply_or_edit(update: Update, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
     if update.callback_query:
         try:
@@ -496,6 +504,26 @@ async def get_selected_profile(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 @admin_only
+async def cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+
+    name = context.user_data.get("profile_name")
+    if not name:
+        await reply_or_edit(update, "Профиль не найден.", main_menu_markup())
+        return ConversationHandler.END
+
+    profile = await store.get(name)
+    index = await store.get_index(name)
+    if not profile or index is None:
+        await reply_or_edit(update, "Профиль не найден.", main_menu_markup())
+        return ConversationHandler.END
+
+    await reply_or_edit(update, format_profile(profile), profile_markup(index))
+    return ConversationHandler.END
+
+
+@admin_only
 async def edit_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.callback_query:
         await update.callback_query.answer()
@@ -503,7 +531,11 @@ async def edit_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not profile:
         await reply_or_edit(update, "Профиль не найден.", main_menu_markup())
         return ConversationHandler.END
-    await reply_or_edit(update, f"Текущее название: <b>{html.escape(profile.name)}</b>\nВведите новое название:")
+    await reply_or_edit(
+        update,
+        f"Текущее название: <b>{html.escape(profile.name)}</b>\nВведите новое название:",
+        cancel_edit_markup(),
+    )
     return EDIT_NAME
 
 
@@ -518,7 +550,7 @@ async def edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         new_name = validate_profile_name(update.effective_message.text)
         await store.replace(profile.name, profile.with_name(new_name))
     except ValueError as exc:
-        await reply_or_edit(update, f"Ошибка: {exc}\nВведите название еще раз:")
+        await reply_or_edit(update, f"Ошибка: {exc}\nВведите название еще раз:", cancel_edit_markup())
         return EDIT_NAME
 
     context.user_data["profile_name"] = new_name
@@ -537,6 +569,7 @@ async def edit_chats_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await reply_or_edit(
         update,
         f"Текущие чаты: <code>{html.escape(','.join(profile.chat_ids))}</code>\nВведите новый список через запятую:",
+        cancel_edit_markup(),
     )
     return EDIT_CHATS
 
@@ -552,7 +585,7 @@ async def edit_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         chat_ids = parse_chat_ids(update.effective_message.text)
         await store.replace(profile.name, profile.with_chats(chat_ids))
     except ValueError as exc:
-        await reply_or_edit(update, f"Ошибка: {exc}\nВведите chat_id еще раз:")
+        await reply_or_edit(update, f"Ошибка: {exc}\nВведите chat_id еще раз:", cancel_edit_markup())
         return EDIT_CHATS
 
     await reply_or_edit(update, "Чаты обновлены.", main_menu_markup())
@@ -567,7 +600,11 @@ async def edit_total_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not profile:
         await reply_or_edit(update, "Профиль не найден.", main_menu_markup())
         return ConversationHandler.END
-    await reply_or_edit(update, f"Сейчас видео: <b>{profile.total_videos}</b>\nВведите новое значение 0-100:")
+    await reply_or_edit(
+        update,
+        f"Сейчас видео: <b>{profile.total_videos}</b>\nВведите новое значение 0-100:",
+        cancel_edit_markup(),
+    )
     return EDIT_TOTAL
 
 
@@ -582,7 +619,7 @@ async def edit_total(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         total = validate_int_range(update.effective_message.text, "total_videos_available", TOTAL_MIN, TOTAL_MAX)
         await store.replace(profile.name, profile.with_total(total))
     except ValueError as exc:
-        await reply_or_edit(update, f"Ошибка: {exc}\nВведите значение еще раз:")
+        await reply_or_edit(update, f"Ошибка: {exc}\nВведите значение еще раз:", cancel_edit_markup())
         return EDIT_TOTAL
 
     await reply_or_edit(update, "Количество видео обновлено.", main_menu_markup())
@@ -597,7 +634,11 @@ async def edit_per_day_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not profile:
         await reply_or_edit(update, "Профиль не найден.", main_menu_markup())
         return ConversationHandler.END
-    await reply_or_edit(update, f"Сейчас видео в день: <b>{profile.videos_per_day}</b>\nВведите новое значение 0-15:")
+    await reply_or_edit(
+        update,
+        f"Сейчас видео в день: <b>{profile.videos_per_day}</b>\nВведите новое значение 0-15:",
+        cancel_edit_markup(),
+    )
     return EDIT_PER_DAY
 
 
@@ -612,7 +653,7 @@ async def edit_per_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         per_day = validate_int_range(update.effective_message.text, "videos_per_day", PER_DAY_MIN, PER_DAY_MAX)
         await store.replace(profile.name, profile.with_per_day(per_day))
     except ValueError as exc:
-        await reply_or_edit(update, f"Ошибка: {exc}\nВведите значение еще раз:")
+        await reply_or_edit(update, f"Ошибка: {exc}\nВведите значение еще раз:", cancel_edit_markup())
         return EDIT_PER_DAY
 
     await reply_or_edit(update, "Количество видео в день обновлено.", main_menu_markup())
@@ -775,10 +816,22 @@ def build_application() -> Application:
             CREATE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_name)],
             CREATE_CHATS: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_chats)],
             CREATE_PER_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_per_day)],
-            EDIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_name)],
-            EDIT_CHATS: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_chats)],
-            EDIT_TOTAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_total)],
-            EDIT_PER_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_per_day)],
+            EDIT_NAME: [
+                CallbackQueryHandler(cancel_edit, pattern="^cancel_edit$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_name),
+            ],
+            EDIT_CHATS: [
+                CallbackQueryHandler(cancel_edit, pattern="^cancel_edit$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_chats),
+            ],
+            EDIT_TOTAL: [
+                CallbackQueryHandler(cancel_edit, pattern="^cancel_edit$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_total),
+            ],
+            EDIT_PER_DAY: [
+                CallbackQueryHandler(cancel_edit, pattern="^cancel_edit$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_per_day),
+            ],
         },
         fallbacks=[
             CommandHandler("start", start),
